@@ -1,0 +1,19 @@
+name = "Interpreter"
+version = "0.1.0"
+defaultTargets = ["Interpreter"]
+
+[[require]]
+name = "mathlib"
+scope = "leanprover-community"
+rev = "v4.29.1"
+
+[[lean_lib]]
+name = "Interpreter"
+
+[[lean_exe]]
+name = "runner"
+root = "Interpreter.Runner"
+
+[[lean_exe]]
+name = "testsuite"
+root = "Interpreter.Testsuite"

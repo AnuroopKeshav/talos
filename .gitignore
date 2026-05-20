@@ -1,0 +1,11 @@
+/.lake
+.lake/
+Examples/rust/*/build/
+Examples/rust/*/rust/target/
+target/
+
+comment.txt
+tasks/code-review*.md
+
+.claude/*.lock
+.claude/worktrees

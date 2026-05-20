@@ -1,0 +1,77 @@
+import Mathlib.Tactic
+import Interpreter.Wasm.Semantics
+
+/-- Simp set used by the `wp_run` tactic to symbolically execute straight-line
+    code. Tag each new atomic `wp_*_cons` lemma with `@[wp_simp]` so it is
+    automatically picked up by `wp_run` without editing the tactic. -/
+register_simp_attr wp_simp
+
+/-! ## Weakest-precondition foundation
+
+`wp m c Q st s` says: from `(st, s)`, executing `c` in module `m` terminates in
+bounded fuel ending in a continuation satisfying `Q`. The existential over fuel
+absorbs all fuel-monotonicity reasoning at the framework level — users never
+write `∀ fuel ≥ N`, never do induction on fuel.
+
+This is a **total correctness** WP. Termination of loops is discharged by a
+user-supplied **variant** (measure) that strictly decreases per iteration.
+Infinite loops like `[.loop [.br 0]]` are unprovable by construction. -/
+
+namespace Wasm
+
+abbrev Assertion  := Continuation → Prop
+abbrev AssertionF := Store → Locals → Prop
+
+abbrev ImplyF (P Q : AssertionF) := ∀ st s, P st s → Q st s
+abbrev Imply  (P Q : Assertion)  := ∀ c, P c → Q c
+
+notation:50 P:51 " ⇒ " Q:51 => ImplyF P Q
+notation:50 P:51 " ⇛ " Q:51 => Imply P Q
+
+@[irreducible]
+def wp (m : Module) (c : Program) (Q : Assertion) : AssertionF :=
+  fun st s => ∃ N, ∀ fuel ≥ N, Q (exec fuel m st s c)
+
+/-! ### Building blocks -/
+
+/-- If `exec` is constant in fuel (at every successor fuel) and equals `k`,
+    then `wp` reduces to `Q k`. At `fuel = 0` `exec` returns `OutOfFuel`, so the
+    `fuel + 1` threshold suffices for every atomic instruction. -/
+theorem wp_of_exec_const_succ {m c Q st s k}
+    (heq : ∀ fuel, exec (fuel + 1) m st s c = k) : wp m c Q st s ↔ Q k := by
+  unfold wp
+  refine ⟨fun ⟨N, h⟩ => ?_, fun hQ => ⟨1, fun fuel hf => ?_⟩⟩
+  · have := h (N + 1) (Nat.le_succ_of_le le_rfl)
+    rw [heq] at this; exact this
+  · obtain ⟨k, rfl⟩ := Nat.exists_eq_succ_of_ne_zero (Nat.one_le_iff_ne_zero.mp hf)
+    rw [heq]; exact hQ
+
+/-- If `exec` agrees with another `exec` at every successor fuel, the two `wp`s
+    coincide. -/
+theorem wp_of_exec_eq_succ {m c c' Q st st' s s'}
+    (heq : ∀ fuel, exec (fuel + 1) m st s c = exec (fuel + 1) m st' s' c') :
+    wp m c Q st s ↔ wp m c' Q st' s' := by
+  unfold wp
+  constructor
+  · rintro ⟨N, h⟩
+    refine ⟨N + 1, fun fuel hf => ?_⟩
+    obtain ⟨k, rfl⟩ := Nat.exists_eq_succ_of_ne_zero
+      (Nat.one_le_iff_ne_zero.mp (Nat.one_le_of_lt hf))
+    rw [← heq]; exact h _ (Nat.le_of_succ_le hf)
+  · rintro ⟨N, h⟩
+    refine ⟨N + 1, fun fuel hf => ?_⟩
+    obtain ⟨k, rfl⟩ := Nat.exists_eq_succ_of_ne_zero
+      (Nat.one_le_iff_ne_zero.mp (Nat.one_le_of_lt hf))
+    rw [heq]; exact h _ (Nat.le_of_succ_le hf)
+
+/-! ### Consequence -/
+
+theorem wp.conseq {Q Q' : Assertion} (hq : Q ⇛ Q') (h : wp m c Q st s) : wp m c Q' st s := by
+  unfold wp at h ⊢
+  obtain ⟨N, hN⟩ := h
+  exact ⟨N, fun fuel hf => hq _ (hN fuel hf)⟩
+
+theorem wp.imp {Q Q' : Assertion} (h : wp m c Q st s) (hq : ∀ c, Q c → Q' c) : wp m c Q' st s :=
+  wp.conseq hq h
+
+end Wasm
