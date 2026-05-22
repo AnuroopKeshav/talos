@@ -30,37 +30,40 @@ def defaultFuel : Nat := 1_000_000
 def testsuiteDir : String := "vendor/testsuite"
 
 def usage : String :=
-"Usage: lake exe testsuite [--fuel N] [-h|--help] [PATTERN]
+"Usage: lake exe testsuite [--fuel N] [--json] [-h|--help] [PATTERN]
 
   PATTERN     If given, only run .wast files whose path contains this substring.
               If omitted, run every top-level .wast file under vendor/testsuite/.
   --fuel N    Per-assertion reduction-step cap, default 1_000_000.
+  --json      Emit results as a JSON array instead of the human-readable report.
   -h, --help  Print this message and exit 0."
 
 structure Args where
   pattern : Option String
   fuel    : Nat
+  json    : Bool := false
 
 partial def splitFlags
-    (toks : List String) (acc : List String) (fuel : Nat) (help : Bool)
-    : Except String (List String × Nat × Bool) :=
+    (toks : List String) (acc : List String) (fuel : Nat) (help : Bool) (json : Bool)
+    : Except String (List String × Nat × Bool × Bool) :=
   match toks with
-  | [] => .ok (acc.reverse, fuel, help)
+  | [] => .ok (acc.reverse, fuel, help, json)
   | "-h" :: rest | "--help" :: rest =>
-    splitFlags rest acc fuel true
+    splitFlags rest acc fuel true json
   | "--fuel" :: nStr :: rest =>
     match nStr.toNat? with
-    | some n => splitFlags rest acc n help
+    | some n => splitFlags rest acc n help json
     | none   => .error s!"--fuel expects a non-negative integer, got `{nStr}`"
   | "--fuel" :: [] => .error "--fuel expects an argument"
-  | tok :: rest => splitFlags rest (tok :: acc) fuel help
+  | "--json" :: rest => splitFlags rest acc fuel help true
+  | tok :: rest => splitFlags rest (tok :: acc) fuel help json
 
 def parseArgs (argv : List String) : Except String (Sum Unit Args) := do
-  let (pos, fuel, help) ← splitFlags argv [] defaultFuel false
+  let (pos, fuel, help, json) ← splitFlags argv [] defaultFuel false false
   if help then return .inl ()
   match pos with
-  | [] => return .inr { pattern := none, fuel }
-  | [p] => return .inr { pattern := some p, fuel }
+  | [] => return .inr { pattern := none, fuel, json }
+  | [p] => return .inr { pattern := some p, fuel, json }
   | _ => .error "expected at most one PATTERN argument"
 
 /-! ## File discovery -/
@@ -164,6 +167,46 @@ def renderFile (fr : FileResult) : String := Id.run do
       buf := buf ++ s!"  L{r.line}  {padR r.kind 14}  {outcomeSummary r.outcome}\n"
   return buf
 
+/-! ## JSON output -/
+
+section
+open Lean (Json)
+
+private def outcomeToJsonFields : Outcome → String × Json
+  | .pass               => ("pass",               .null)
+  | .fail msg           => ("fail",               .str msg)
+  | .skipped r          => ("skipped",            .str r)
+  | .decodeError m      => ("decode_error",       .str m)
+  | .interpreterError m => ("interpreter_error",  .str m)
+  | .outOfFuel          => ("out_of_fuel",        .null)
+  | .moduleUnavailable  => ("module_unavailable", .null)
+
+private def cmdResultToJson (file : String) (r : CmdResult) : Json :=
+  let (outcomeTag, detail) := outcomeToJsonFields r.outcome
+  .mkObj [
+    ("file",    .str file),
+    ("line",    .num ⟨(r.line : Int), 0⟩),
+    ("kind",    .str r.kind),
+    ("outcome", .str outcomeTag),
+    ("detail",  detail)
+  ]
+
+private def fileResultToJson (fr : FileResult) : Array Json :=
+  let file := basename fr.path
+  let rows := fr.results.map (cmdResultToJson file)
+  match fr.fileError with
+  | none => rows
+  | some e =>
+    rows.push (.mkObj [
+      ("file",    .str file),
+      ("line",    .num ⟨(0 : Int), 0⟩),
+      ("kind",    .str "file_error"),
+      ("outcome", .str "error"),
+      ("detail",  .str e)
+    ])
+
+end
+
 /-! ## Main loop -/
 
 def EXIT_OK   : UInt32 := 0
@@ -185,25 +228,34 @@ def runAll (a : Args) : IO UInt32 := do
   let files ← try discoverFiles a.pattern
     catch e =>
       IO.eprintln s!"error: could not read {testsuiteDir}: {e.toString}"
+      if a.json then IO.println "[]"
       return EXIT_ERR
   if files.isEmpty then
     let msg := match a.pattern with
       | some p => s!"no .wast files matched `{p}` in {testsuiteDir}"
       | none   => s!"no .wast files in {testsuiteDir}"
     IO.eprintln msg
+    if a.json then IO.println "[]"
     return EXIT_ERR
 
   let tmpRoot ← match (← makeTempDir) with
     | .ok d    => pure d
-    | .error e => IO.eprintln s!"error: {e}"; return EXIT_ERR
+    | .error e =>
+      IO.eprintln s!"error: {e}"
+      if a.json then IO.println "[]"
+      return EXIT_ERR
 
   let mut totals : Counts := {}
   let mut anyFailure := false
+  let mut jsonRows : Array Lean.Json := #[]
 
   try
     for path in files do
       let fr ← Wasm.Testsuite.runFile path tmpRoot a.fuel
-      IO.print (renderFile fr)
+      if a.json then
+        jsonRows := jsonRows.append (fileResultToJson fr)
+      else
+        IO.print (renderFile fr)
       let c := tally fr.results
       totals := totals + c
       if c.hasFailure then anyFailure := true
@@ -211,8 +263,11 @@ def runAll (a : Args) : IO UInt32 := do
     -- Best-effort cleanup; if it fails, the OS will reap eventually.
     try IO.FS.removeDirAll tmpRoot catch _ => pure ()
 
-  IO.println ""
-  IO.println s!"Totals: {totals.pass} pass  {totals.fail} fail  {totals.skipped} skip  {totals.cascade} cascade  {totals.decodeError} decode-err  {totals.interpreterError} interp-err  {totals.outOfFuel} out-of-fuel"
+  if a.json then
+    IO.println (toString (Lean.Json.arr jsonRows))
+  else do
+    IO.println ""
+    IO.println s!"Totals: {totals.pass} pass  {totals.fail} fail  {totals.skipped} skip  {totals.cascade} cascade  {totals.decodeError} decode-err  {totals.interpreterError} interp-err  {totals.outOfFuel} out-of-fuel"
 
   return if anyFailure then EXIT_FAIL else EXIT_OK
 
