@@ -1,6 +1,7 @@
 import Verifier.Emit
 import Verifier.Config
 import Verifier.Discovery
+import Verifier.Extract
 
 /-!
 # `verifier` CLI entry point
@@ -481,12 +482,57 @@ private def buildAndEmit (pair : Pair) : IO Unit := do
   | .error e => throw <| IO.userError s!"wat decoder rejected the generated module: {e}"
   | .ok m    => emitProgramFile pair m watText
 
-/-- Run `check` on a single pair, then `lake build` (unless skipped). -/
-private def checkOne (pair : Pair) (skipBuild : Bool) : IO Unit := do
-  buildAndEmit pair
-  unless skipBuild do
-    IO.println s!"==> lake build ({pair.leanDir})"
-    runOrDie { cmd := "lake", args := #["build"], cwd := some pair.leanDir }
+/-- Wrap the extractor's raw `{"namespace", "specs", "proofs"}` JSON
+with project-level metadata. The shape matches the sidecar schema
+documented in `tasks/03-verifier-redo.md` (rust-side fields are
+populated in Phase 3). -/
+private def wrapSidecar (pair : Pair) (crate : String) (buildOk : Bool)
+    (extractorJson : String) : String :=
+  let extractor := extractorJson.trimAscii
+  let inner :=
+    if extractor.isEmpty then "{\"namespace\":\"\",\"specs\":[],\"proofs\":[]}"
+    else extractor
+  -- Surface project metadata as a top-level object, then merge the
+  -- extractor body via a `"lean"` key (keeps both layers easy to grep).
+  let okStr := if buildOk then "true" else "false"
+  let lbrace := "{"
+  let rbrace := "}"
+  String.intercalate "\n" [
+    lbrace,
+    "  \"project\": " ++ lbrace,
+    s!"    \"rustDir\":   \"{pair.rustDir}\",",
+    s!"    \"leanDir\":   \"{pair.leanDir}\",",
+    s!"    \"subfolder\": \"{pair.verificationFolder}\",",
+    s!"    \"crate\":     \"{crate}\"",
+    "  " ++ rbrace ++ ",",
+    s!"  \"buildOk\": {okStr},",
+    "  \"rustExports\": [],",
+    s!"  \"lean\": {inner}",
+    rbrace
+  ]
+
+/-- Run the per-project extractor and write its JSON sidecar. Requires
+`_verifier_extract` to have been built already (via the umbrella
+`lake build`). -/
+private def extractOne (pair : Pair) (crate : String) (buildOk : Bool) : IO Unit := do
+  let modName := subfolderToModule pair.verificationFolder
+  let extractor :=
+    if buildOk then
+      try
+        let out ← IO.Process.output {
+          cmd := "lake", args := #["exe", "_verifier_extract", modName],
+          cwd := some pair.leanDir
+        }
+        if out.exitCode = 0 then pure out.stdout
+        else do
+          IO.eprintln s!"extractor failed for {modName} (exit {out.exitCode}):\n{out.stderr}"
+          pure ""
+      catch e => do
+        IO.eprintln s!"extractor exception for {modName}: {e}"; pure ""
+    else
+      pure ""
+  let json := wrapSidecar pair crate buildOk (← extractor)
+  writeFile (pair.subfolderDir / ".verifier-extract.json") json
 
 /-- Run `check` over many pairs. Errors are collected per pair; one
 `lake build` is invoked per unique lean project after every per-pair
@@ -499,25 +545,46 @@ private def checkMany (pairs : Array Pair) (skipBuild : Bool) : IO Bool := do
     catch e =>
       IO.eprintln s!"error in {pair.rustDir}: {e}"
       emitErrors := emitErrors.push (pair.rustDir, toString e)
-  -- Group by lean project for `lake build`.
+  -- Per-leanDir bookkeeping: install the extractor source + lakefile
+  -- stanza, then run `lake build` once.
   let mut seen : Array FilePath := #[]
+  let mut buildOkOf : Array (FilePath × Bool) := #[]
   let mut buildErrors : Array (FilePath × String) := #[]
   unless skipBuild do
     for pair in pairs do
       if seen.contains pair.leanDir then continue
       seen := seen.push pair.leanDir
+      try
+        let lib ← leanLibName pair.leanDir
+        Extract.installExtractor pair.leanDir lib
+      catch e =>
+        IO.eprintln s!"warning: could not install extractor in {pair.leanDir}: {e}"
       IO.println s!"==> lake build ({pair.leanDir})"
       let ok ← runChecked { cmd := "lake", args := #["build"], cwd := some pair.leanDir }
+      buildOkOf := buildOkOf.push (pair.leanDir, ok)
       unless ok do
         buildErrors := buildErrors.push (pair.leanDir, "lake build failed")
+  -- Per-pair extraction.
+  let mut extractErrors : Array (FilePath × String) := #[]
+  for pair in pairs do
+    let cargoToml := pair.rustDir / "Cargo.toml"
+    let crate ← try cargoCrateName cargoToml catch _ => pure "?"
+    let buildOk :=
+      if skipBuild then false
+      else (buildOkOf.find? (·.1 = pair.leanDir)).map (·.2) |>.getD false
+    try extractOne pair crate buildOk
+    catch e =>
+      extractErrors := extractErrors.push (pair.rustDir, toString e)
   -- Summary.
   IO.println ""
-  IO.println s!"==> {pairs.size} project(s), {emitErrors.size} emit error(s), {buildErrors.size} build error(s)"
+  IO.println s!"==> {pairs.size} project(s), {emitErrors.size} emit error(s), {buildErrors.size} build error(s), {extractErrors.size} extract error(s)"
   for (d, e) in emitErrors do
     IO.eprintln s!"  emit fail: {d}: {e}"
   for (d, e) in buildErrors do
     IO.eprintln s!"  build fail: {d}: {e}"
-  pure (emitErrors.isEmpty ∧ buildErrors.isEmpty)
+  for (d, e) in extractErrors do
+    IO.eprintln s!"  extract fail: {d}: {e}"
+  pure (emitErrors.isEmpty ∧ buildErrors.isEmpty ∧ extractErrors.isEmpty)
 
 private def cmdCheck (pathOpt : Option String) (skipBuild : Bool) : IO Unit := do
   let pairs : Array Pair ← match pathOpt with
