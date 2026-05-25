@@ -18,24 +18,30 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: main
-          submodules: recursive
+          submodules: true
 
-      # Set up Lean toolchain and restore mathlib cache.
-      # continue-on-error so that a broken proof on main doesn't block the diff.
+      # Build the testsuite binary and restore the mathlib cache.
+      # continue-on-error so a broken proof on main doesn't block the diff
+      # (the testsuite binary only depends on the interpreter core, not the
+      # proof examples, so it usually builds fine regardless).
       - uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: interpreter
+          build-args: testsuite
+          use-mathlib-cache: true
         continue-on-error: true
 
-      - uses: Swatinem/rust-cache@v2
-
       - name: Install wasm-tools
-        run: cargo install wasm-tools
-
-      - name: Build testsuite binary
-        run: lake build testsuite
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-tools
 
       - name: Run testsuite
-        run: lake exe testsuite --json > baseline.json
-        # Failures in the testsuite don't fail this step — we capture the JSON.
+        # lake -d interpreter keeps the shell CWD (repo root) so the binary
+        # finds vendor/testsuite/ relative to the repo root.
+        run: lake -d interpreter exe testsuite --json > baseline.json
+        # Testsuite failures don't fail this step — we capture the JSON
+        # regardless and let the diff decide what matters.
         continue-on-error: true
 
       - uses: actions/upload-artifact@v4
@@ -51,21 +57,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: true
 
       - uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: interpreter
+          build-args: testsuite
+          use-mathlib-cache: true
         continue-on-error: true
 
-      - uses: Swatinem/rust-cache@v2
-
       - name: Install wasm-tools
-        run: cargo install wasm-tools
-
-      - name: Build testsuite binary
-        run: lake build testsuite
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-tools
 
       - name: Run testsuite
-        run: lake exe testsuite --json > pr.json
+        run: lake -d interpreter exe testsuite --json > pr.json
         continue-on-error: true
 
       - uses: actions/upload-artifact@v4
