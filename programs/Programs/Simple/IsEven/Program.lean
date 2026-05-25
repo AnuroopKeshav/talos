@@ -26,10 +26,16 @@ def func0 : Wasm.Program :=
 def «module» : Wasm.Module :=
 {
   funcs := [
-    { params := [.i32], locals := [], body := func0 }
+    { params := [.i32], locals := [], body := func0, results := some [.i32] }
   ],
   exports := [
     { name := "is_even", funcIdx := 0 }
+  ],
+  memory := some { pagesMin := (16 : UInt32), pagesMax := none, data := [] },
+  globals := [
+    { type := .i32, init := .i32 (1048576 : UInt32) },
+    { type := .i32, init := .i32 (1048576 : UInt32) },
+    { type := .i32, init := .i32 (1048576 : UInt32) }
   ]
 }
 

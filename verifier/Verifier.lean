@@ -3,3 +3,4 @@ import Verifier.Toml
 import Verifier.Config
 import Verifier.Discovery
 import Verifier.Extract
+import Verifier.RustExtract

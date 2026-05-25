@@ -2,6 +2,7 @@ import Verifier.Emit
 import Verifier.Config
 import Verifier.Discovery
 import Verifier.Extract
+import Verifier.RustExtract
 
 /-!
 # `verifier` CLI entry point
@@ -483,12 +484,10 @@ private def buildAndEmit (pair : Pair) : IO Unit := do
   | .ok m    => emitProgramFile pair m watText
 
 /-- Wrap the extractor's raw `{"namespace", "specs", "proofs"}` JSON
-with project-level metadata. The shape matches the sidecar schema
-documented in `tasks/03-verifier-redo.md` (rust-side fields are
-populated in Phase 3). -/
+with project-level metadata. -/
 private def wrapSidecar (pair : Pair) (crate : String) (buildOk : Bool)
-    (extractorJson : String) : String :=
-  let extractor := extractorJson.trimAscii
+    (extractorJson rustExportsJson : String) : String :=
+  let extractor := extractorJson.trimAscii.toString
   let inner :=
     if extractor.isEmpty then "{\"namespace\":\"\",\"specs\":[],\"proofs\":[]}"
     else extractor
@@ -506,17 +505,18 @@ private def wrapSidecar (pair : Pair) (crate : String) (buildOk : Bool)
     s!"    \"crate\":     \"{crate}\"",
     "  " ++ rbrace ++ ",",
     s!"  \"buildOk\": {okStr},",
-    "  \"rustExports\": [],",
+    s!"  \"rustExports\": {rustExportsJson},",
     s!"  \"lean\": {inner}",
     rbrace
   ]
 
-/-- Run the per-project extractor and write its JSON sidecar. Requires
-`_verifier_extract` to have been built already (via the umbrella
-`lake build`). -/
+/-- Run the per-project extractors (Lean + Rust) and write the JSON
+sidecar. The Lean side requires `_verifier_extract` to have been built
+already (via the umbrella `lake build`); the Rust side scans `.rs`
+sources directly and runs regardless. -/
 private def extractOne (pair : Pair) (crate : String) (buildOk : Bool) : IO Unit := do
   let modName := subfolderToModule pair.verificationFolder
-  let extractor :=
+  let leanJson : String ←
     if buildOk then
       try
         let out ← IO.Process.output {
@@ -531,7 +531,13 @@ private def extractOne (pair : Pair) (crate : String) (buildOk : Bool) : IO Unit
         IO.eprintln s!"extractor exception for {modName}: {e}"; pure ""
     else
       pure ""
-  let json := wrapSidecar pair crate buildOk (← extractor)
+  let rustJson : String ←
+    try
+      let exports ← RustExtract.scanProject pair.rustDir
+      pure (RustExtract.emitExports pair.rustDir exports)
+    catch e => do
+      IO.eprintln s!"rust scanner failed for {pair.rustDir}: {e}"; pure "[]"
+  let json := wrapSidecar pair crate buildOk leanJson rustJson
   writeFile (pair.subfolderDir / ".verifier-extract.json") json
 
 /-- Run `check` over many pairs. Errors are collected per pair; one
