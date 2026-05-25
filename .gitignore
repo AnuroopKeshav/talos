@@ -12,3 +12,4 @@ tasks/code-review*.md
 .claude/*.lock
 .claude/worktrees
 
+tasks/
