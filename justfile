@@ -19,11 +19,10 @@ docs:
 testsuite pattern="":
     #!/usr/bin/env bash
     set -euo pipefail
-    cd "{{justfile_directory()}}/interpreter"
     if [[ -n "{{pattern}}" ]]; then
-        lake exe testsuite "{{pattern}}"
+        lake -d "{{justfile_directory()}}/interpreter" exe testsuite "{{pattern}}"
     else
-        lake exe testsuite
+        lake -d "{{justfile_directory()}}/interpreter" exe testsuite
     fi
 
 # Smoke-test the runner executable against samples/.
