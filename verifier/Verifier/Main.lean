@@ -3,6 +3,7 @@ import Verifier.Config
 import Verifier.Discovery
 import Verifier.Extract
 import Verifier.RustExtract
+import Verifier.Report
 
 /-!
 # `verifier` CLI entry point
@@ -62,7 +63,7 @@ private def usage : String :=
   "Usage:\n" ++
   "  lake exe verifier new        <rust-path> <lean-path> <subfolder>\n" ++
   "  lake exe verifier check      [path] [--no-build]\n" ++
-  "  lake exe verifier report     [--out <dir>]"
+  "  lake exe verifier report     [--out <dir>] [--no-build]"
 
 private def die (msg : String) : IO α := do
   IO.eprintln msg
@@ -510,11 +511,11 @@ private def wrapSidecar (pair : Pair) (crate : String) (buildOk : Bool)
     rbrace
   ]
 
-/-- Run the per-project extractors (Lean + Rust) and write the JSON
-sidecar. The Lean side requires `_verifier_extract` to have been built
-already (via the umbrella `lake build`); the Rust side scans `.rs`
-sources directly and runs regardless. -/
-private def extractOne (pair : Pair) (crate : String) (buildOk : Bool) : IO Unit := do
+/-- Run the per-project extractors (Lean + Rust), write the JSON
+sidecar, and return the project data for downstream consumers (the
+report). -/
+private def extractOne (pair : Pair) (crate : String) (buildOk : Bool) :
+    IO Report.ProjectData := do
   let modName := subfolderToModule pair.verificationFolder
   let leanJson : String ←
     if buildOk then
@@ -531,19 +532,28 @@ private def extractOne (pair : Pair) (crate : String) (buildOk : Bool) : IO Unit
         IO.eprintln s!"extractor exception for {modName}: {e}"; pure ""
     else
       pure ""
-  let rustJson : String ←
-    try
-      let exports ← RustExtract.scanProject pair.rustDir
-      pure (RustExtract.emitExports pair.rustDir exports)
+  let exports : Array RustExtract.Export ←
+    try RustExtract.scanProject pair.rustDir
     catch e => do
-      IO.eprintln s!"rust scanner failed for {pair.rustDir}: {e}"; pure "[]"
+      IO.eprintln s!"rust scanner failed for {pair.rustDir}: {e}"; pure #[]
+  let rustJson := RustExtract.emitExports pair.rustDir exports
   let json := wrapSidecar pair crate buildOk leanJson rustJson
   writeFile (pair.subfolderDir / ".verifier-extract.json") json
+  pure {
+    rustDir := pair.rustDir,
+    leanDir := pair.leanDir,
+    subfolder := pair.verificationFolder,
+    crate := crate,
+    buildOk := buildOk,
+    rustExports := exports,
+    leanJson := leanJson
+  }
 
 /-- Run `check` over many pairs. Errors are collected per pair; one
 `lake build` is invoked per unique lean project after every per-pair
-emit has been attempted. Returns true iff every step succeeded. -/
-private def checkMany (pairs : Array Pair) (skipBuild : Bool) : IO Bool := do
+emit has been attempted. Returns a (allOk, projectData) pair. -/
+private def checkMany (pairs : Array Pair) (skipBuild : Bool) :
+    IO (Bool × Array Report.ProjectData) := do
   let mut emitErrors : Array (FilePath × String) := #[]
   for pair in pairs do
     try
@@ -572,13 +582,16 @@ private def checkMany (pairs : Array Pair) (skipBuild : Bool) : IO Bool := do
         buildErrors := buildErrors.push (pair.leanDir, "lake build failed")
   -- Per-pair extraction.
   let mut extractErrors : Array (FilePath × String) := #[]
+  let mut data : Array Report.ProjectData := #[]
   for pair in pairs do
     let cargoToml := pair.rustDir / "Cargo.toml"
     let crate ← try cargoCrateName cargoToml catch _ => pure "?"
     let buildOk :=
       if skipBuild then false
       else (buildOkOf.find? (·.1 = pair.leanDir)).map (·.2) |>.getD false
-    try extractOne pair crate buildOk
+    try
+      let d ← extractOne pair crate buildOk
+      data := data.push d
     catch e =>
       extractErrors := extractErrors.push (pair.rustDir, toString e)
   -- Summary.
@@ -590,7 +603,7 @@ private def checkMany (pairs : Array Pair) (skipBuild : Bool) : IO Bool := do
     IO.eprintln s!"  build fail: {d}: {e}"
   for (d, e) in extractErrors do
     IO.eprintln s!"  extract fail: {d}: {e}"
-  pure (emitErrors.isEmpty ∧ buildErrors.isEmpty ∧ extractErrors.isEmpty)
+  pure (emitErrors.isEmpty ∧ buildErrors.isEmpty ∧ extractErrors.isEmpty, data)
 
 private def cmdCheck (pathOpt : Option String) (skipBuild : Bool) : IO Unit := do
   let pairs : Array Pair ← match pathOpt with
@@ -608,15 +621,33 @@ private def cmdCheck (pathOpt : Option String) (skipBuild : Bool) : IO Unit := d
         let pair ← resolvePairFromRust (← absNormalize d)
         acc := acc.push pair
       pure acc
-  let ok ← checkMany pairs skipBuild
+  let (ok, _) ← checkMany pairs skipBuild
   unless ok do IO.Process.exit 1
 
 -- ----------------------------------------------------------------------------
--- `report` (stub — implemented in Phase 4)
+-- `report`
 -- ----------------------------------------------------------------------------
 
-private def cmdReport (_outDir : Option String) : IO Unit :=
-  die "verifier report: not yet implemented (Phase 4)"
+/-- Discover, run the full check pipeline, then write the HTML report
+to `outDir` (default `./verifier-report/`). With `skipBuild`, omits
+`lake build` and the Lean-side extraction (still renders the rust side
+and source-browser pages). -/
+private def cmdReport (outDir : Option String) (skipBuild : Bool) : IO Unit := do
+  let cwd ← IO.currentDir
+  IO.println s!"==> discovering verifier.toml under {cwd}"
+  let rustDirs ← Discovery.discoverProjects cwd
+  if rustDirs.isEmpty then
+    die s!"no `verifier.toml` files found under {cwd}\n(hint: run `verifier new` to bootstrap one)"
+  let mut pairs : Array Pair := #[]
+  for d in rustDirs do
+    let pair ← resolvePairFromRust (← absNormalize d)
+    pairs := pairs.push pair
+  let (_, data) ← checkMany pairs skipBuild
+  let out : FilePath := ⟨outDir.getD "verifier-report"⟩
+  let outAbs ← absNormalize out
+  IO.println s!"==> writing report to {outAbs}"
+  Report.writeReport outAbs data
+  IO.println s!"==> open {outAbs}/index.html"
 
 -- ----------------------------------------------------------------------------
 -- main
@@ -632,12 +663,12 @@ private def parseCheckArgs (args : List String) : Option String × Bool :=
   | [p]    => (some p, skipBuild)
   | _      => (none, skipBuild)  -- multiple positionals -> caller will reject
 
-private def parseReportArgs (args : List String) : Option String :=
-  let rec go : List String → Option String
+private def parseReportArgs (args : List String) : Option String × Bool :=
+  let rec findOut : List String → Option String
     | "--out" :: v :: _ => some v
-    | _ :: rest         => go rest
+    | _ :: rest         => findOut rest
     | []                => none
-  go args
+  (findOut args, args.contains "--no-build")
 
 def main (args : List String) : IO UInt32 := do
   match args with
@@ -652,7 +683,8 @@ def main (args : List String) : IO UInt32 := do
     else
       cmdCheck path skipBuild; pure 0
   | "report" :: rest =>
-    cmdReport (parseReportArgs rest); pure 0
+    let (outDir, skipBuild) := parseReportArgs rest
+    cmdReport outDir skipBuild; pure 0
   | _ =>
     IO.eprintln usage; pure 1
 
