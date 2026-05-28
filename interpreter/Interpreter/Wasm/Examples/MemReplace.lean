@@ -26,7 +26,7 @@ def replaceBody : Program := [
 ]
 
 def replaceModule : Module :=
-  { funcs := [{ params := [.i32], locals := [.i32], body := replaceBody }]
+  { funcs := [{ params := [.i32], locals := [.i32], body := replaceBody, results := [.i32] }]
     memory := some { pagesMin := 1, data := [{ offset := some 0, bytes := [42, 0, 0, 0] }] } }
 
 theorem replaceModule_init_mem :
