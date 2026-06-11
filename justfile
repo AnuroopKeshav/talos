@@ -194,4 +194,3 @@ docs:
 [working-directory("scripts")]
 clean:
     ./clean.sh
-
